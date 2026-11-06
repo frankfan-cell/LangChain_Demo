@@ -1,3 +1,4 @@
+from langchain_community.document_loaders import PyPDFLoader
 import hashlib
 from langchain_core.messages import AIMessage, HumanMessage
 import os
@@ -13,25 +14,54 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 project_dir = Path(__file__).parent
-document_path = project_dir / "data" / "knowledge.md"
+data_dir = project_dir / "data"
+markdown_files = sorted(data_dir.rglob("*.md"))
+pdf_files = sorted(data_dir.rglob("*.pdf"))
 
-source_name = "data/knowledge.md"
-content = document_path.read_text(encoding="utf-8")
-content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+if not markdown_files and not pdf_files:
+    raise FileNotFoundError(f"目录中没有 Markdown 或 PDF 文件：{data_dir}")
 
-document = Document(
-    page_content=content,
-    metadata={
-        "source": source_name,
-        "content_hash": content_hash,
-    },
-)
+documents = []
+corpus_digest = hashlib.sha256()
+
+for file_path in markdown_files:
+    source_name = file_path.relative_to(project_dir).as_posix()
+    content = file_path.read_text(encoding="utf-8")
+
+    corpus_digest.update(source_name.encode("utf-8"))
+    corpus_digest.update(b"\0")
+    corpus_digest.update(content.encode("utf-8"))
+    corpus_digest.update(b"\0")
+
+    documents.append(Document(
+        page_content=content,
+        metadata={"source": source_name},
+    ))
+
+for file_path in pdf_files:
+    source_name = file_path.relative_to(project_dir).as_posix()
+    pdf_bytes = file_path.read_bytes()
+
+    corpus_digest.update(source_name.encode("utf-8"))
+    corpus_digest.update(b"\0")
+    corpus_digest.update(pdf_bytes)
+    corpus_digest.update(b"\0")
+
+    for page_document in PyPDFLoader(str(file_path)).load():
+        page_document.metadata["source"] = source_name
+        documents.append(page_document)
+
+corpus_hash = corpus_digest.hexdigest()
+for document in documents:
+    document.metadata["corpus_hash"] = corpus_hash
+for document in documents:
+    document.metadata["corpus_hash"] = corpus_hash
 
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=60,
     chunk_overlap=10,
 )
-chunks = splitter.split_documents([document])
+chunks = splitter.split_documents(documents)
 
 embeddings = OllamaEmbeddings(model="bge-m3")
 db_path = project_dir / "chroma_db"
@@ -42,14 +72,14 @@ vector_store = Chroma(
     persist_directory=str(db_path),
 )
 
-existing_data = vector_store.get(where={"source": source_name})
+existing_data = vector_store.get()
 existing_ids = existing_data["ids"]
 existing_metadata = existing_data["metadatas"] or []
 
 index_is_current = (
     bool(existing_ids)
     and all(
-        metadata.get("content_hash") == content_hash
+        metadata.get("corpus_hash") == corpus_hash
         for metadata in existing_metadata
     )
 )
@@ -90,6 +120,7 @@ prompt = ChatPromptTemplate.from_messages([
 
 chain = prompt | model
 history = []
+min_relevance_score = 0.45
 
 print("图书馆知识库问答已启动，输入“退出”结束。")
 
@@ -103,7 +134,30 @@ while True:
     if not question:
         continue
 
-    retrieved_docs = vector_store.similarity_search(question, k=3)
+    retrieved_with_scores = (
+        vector_store.similarity_search_with_relevance_scores(question, k=3)
+    )
+    
+    relevant_results = [
+        (doc, score)
+        for doc, score in retrieved_with_scores
+        if score >= min_relevance_score
+    ]
+    
+    if not relevant_results:
+        print("\n资料中没有找到足够相关的信息。")
+        continue
+    
+    retrieved_docs = []
+    
+    for index, (doc, score) in enumerate(relevant_results, start=1):
+        retrieved_docs.append(doc)
+        print(
+            f"\n--- 检索片段 {index} | 相关度：{score:.3f} "
+            f"| 来源：{doc.metadata.get('source')} ---"
+        )
+        print(doc.page_content)
+    
     context = "\n\n".join(doc.page_content for doc in retrieved_docs)
     sources = list(dict.fromkeys(
         doc.metadata.get("source", "未知来源")
