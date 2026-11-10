@@ -117,6 +117,18 @@ model = ChatOpenAI(
     temperature=0,
 )
 
+rewrite_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "将用户当前问题改写成脱离对话也能理解的独立检索问题。"
+        "只改写问题，不要回答，也不要添加用户没提过的事实。",
+    ),
+    MessagesPlaceholder(variable_name="history"),
+    ("human", "当前问题：{question}"),
+])
+
+rewrite_chain = rewrite_prompt | model
+
 prompt = ChatPromptTemplate.from_messages([
     (
         "system",
@@ -146,8 +158,21 @@ while True:
     if not question:
         continue
 
+    retrieval_question = question
+    
+    if history:
+        rewritten = rewrite_chain.invoke({
+            "history": history,
+            "question": question,
+        })
+        retrieval_question = rewritten.content.strip()
+        print(f"检索问题：{retrieval_question}")
+    
     retrieved_with_scores = (
-        vector_store.similarity_search_with_relevance_scores(question, k=3)
+        vector_store.similarity_search_with_relevance_scores(
+            retrieval_question,
+            k=3,
+        )
     )
     
     relevant_results = [
