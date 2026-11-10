@@ -1,4 +1,4 @@
-from langchain_community.document_loaders import PyPDFLoader
+from pypdf import PdfReader
 import hashlib
 from langchain_core.messages import AIMessage, HumanMessage
 import os
@@ -23,6 +23,7 @@ if not markdown_files and not pdf_files:
 
 documents = []
 corpus_digest = hashlib.sha256()
+corpus_digest.update(b"pdf-parser:pypdf-v1\0")
 
 for file_path in markdown_files:
     source_name = file_path.relative_to(project_dir).as_posix()
@@ -47,9 +48,20 @@ for file_path in pdf_files:
     corpus_digest.update(pdf_bytes)
     corpus_digest.update(b"\0")
 
-    for page_document in PyPDFLoader(str(file_path)).load():
-        page_document.metadata["source"] = source_name
-        documents.append(page_document)
+    reader = PdfReader(str(file_path))
+    
+    for page_number, page in enumerate(reader.pages):
+        page_text = page.extract_text() or ""
+        if not page_text.strip():
+            continue
+    
+        documents.append(Document(
+            page_content=page_text,
+            metadata={
+                "source": source_name,
+                "page": page_number,
+            },
+        ))
 
 corpus_hash = corpus_digest.hexdigest()
 for document in documents:
@@ -159,10 +171,19 @@ while True:
         print(doc.page_content)
     
     context = "\n\n".join(doc.page_content for doc in retrieved_docs)
-    sources = list(dict.fromkeys(
-        doc.metadata.get("source", "未知来源")
-        for doc in retrieved_docs
-    ))
+    sources = []
+    
+    for doc in retrieved_docs:
+        source = doc.metadata.get("source", "未知来源")
+        page = doc.metadata.get("page")
+    
+        if page is None:
+            citation = source
+        else:
+            citation = f"{source}（第 {page + 1} 页）"
+    
+        if citation not in sources:
+            sources.append(citation)
 
     response = chain.invoke({
         "history": history,
